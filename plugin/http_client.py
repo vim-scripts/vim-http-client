@@ -1,5 +1,7 @@
+import json
 import re
 import requests
+import simplejson
 
 from_cmdline = False
 try:
@@ -15,6 +17,7 @@ if not from_cmdline:
 METHOD_REGEX = re.compile('^(GET|POST|DELETE|PUT|HEAD|OPTIONS|PATCH) (.*)$')
 HEADER_REGEX = re.compile('^([^()<>@,;:\<>/\[\]?={}]+):\\s*(.*)$')
 VAR_REGEX = re.compile('^# ?(:[^: ]+)\\s*=\\s*(.+)$')
+GLOBAL_VAR_REGEX = re.compile('^# ?(\$[^$ ]+)\\s*=\\s*(.+)$')
 
 
 def replace_vars(string, variables):
@@ -27,8 +30,10 @@ def is_comment(s):
     return s.startswith('#')
 
 
-def do_request(block):
-    variables = dict((m.groups() for m in (VAR_REGEX.match(l) for l in block) if m))
+def do_request(block, buf):
+    variables = dict((m.groups() for m in (GLOBAL_VAR_REGEX.match(l) for l in buf) if m))
+    variables.update(dict((m.groups() for m in (VAR_REGEX.match(l) for l in block) if m)))
+
     block = [line for line in block if not is_comment(line) and line.strip() != '']
 
     if len(block) == 0:
@@ -63,22 +68,32 @@ def do_request(block):
       data = '\n'.join(block)
 
     response = requests.request(method, url, headers=headers, data=data)
+    content_type = response.headers.get('Content-Type', '').split(';')[0]
+
+    response_body = response.text
+    if content_type == 'application/json':
+        try:
+            response_body = json.dumps(response.json(), sort_keys=True, indent=2, separators=(',', ': '))
+        except simplejson.scanner.JSONDecodeError:
+            pass
+
     display = (
-        response.text.split('\n') +
+        response_body.split('\n') +
         ['', '// status code: %s' % response.status_code] +
         ['// %s: %s' % (k, v) for k, v in response.headers.items()]
     )
 
-    return display, response.headers.get('Content-Type', '').split(';')[0]
+    return display, content_type
 
 
 # Vim methods.
 
-VIM_FILETYPES_BY_CONTENT_TYPE = {
-    'application/json': 'javascript',
-    'application/xml': 'xml',
-    'text/html': 'html'
-}
+def vim_filetypes_by_content_type():
+    return {
+        'application/json': vim.eval('g:http_client_json_ft'),
+        'application/xml': 'xml',
+        'text/html': 'html'
+    }
 
 BUFFER_NAME = '__HTTP_Client_Response__'
 
@@ -114,10 +129,10 @@ def do_request_from_buffer():
     win = vim.current.window
     line_num = win.cursor[0] - 1
     block = find_block(win.buffer, line_num)
-    result = do_request(block)
+    result = do_request(block, win.buffer)
     if result:
         response, content_type = result
-        vim_ft = VIM_FILETYPES_BY_CONTENT_TYPE.get(content_type, 'text')
+        vim_ft = vim_filetypes_by_content_type().get(content_type, 'text')
         open_scratch_buffer(response, vim_ft)
 
 
@@ -140,27 +155,34 @@ def run_tests():
         'GET http://httpbin.org/headers',
         'X-Hey: :a',
         '# comment'
-    ]))
+    ], []))
     test(resp['headers']['X-Hey'] == 'barf', 'Headers are passed with variable substitution.')
 
     resp = extract_json(do_request([
         '# :a = barf',
         'GET http://httpbin.org/get?data=:a'
-    ]))
+    ], []))
     test(resp['args']['data'] == 'barf', 'GET data is passed with variable substitution.')
 
     resp = extract_json(do_request([
         'POST http://httpbin.org/post',
         'some data'
-    ]))
+    ], []))
     test(resp['data'] == 'some data', 'POST data is passed with variable substitution.')
 
     resp = extract_json(do_request([
         'POST http://httpbin.org/post',
         'forma=a',
         'formb=b',
-    ]))
+    ], []))
     test(resp['form']['forma'] == 'a', 'POST form data is passed.')
+
+    resp = extract_json(do_request([
+        'POST http://$global/post',
+        'forma=a',
+        'formb=b',
+    ], [ '# $global = httpbin.org']))
+    test(resp['form']['forma'] == 'a', 'Global variables are substituted.')
 
 
 if from_cmdline:
